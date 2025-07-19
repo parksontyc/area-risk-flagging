@@ -210,3 +210,18 @@ def sales_start_time(row) -> str:
     return ""
     
 
+def to_year_quarter(ts) -> str:
+    if pd.isna(ts):
+        return ""
+    s = str(ts).strip()
+    if len(s) < 5:
+        return ""
+    year = s[:3]
+    try:
+        month = int(s[3:5])
+    except ValueError:
+        return ""
+    quarter = (month - 1) // 3 + 1
+    if quarter < 1 or quarter > 4:
+        return ""
+    return f"{year}Y{quarter}S"
