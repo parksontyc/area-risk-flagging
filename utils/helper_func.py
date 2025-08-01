@@ -3,6 +3,7 @@ import re
 import time
 import datetime
 from typing import Tuple
+import ast
 
 from tqdm import tqdm 
 import pandas as pd
@@ -31,6 +32,38 @@ def fetch_data(url):
         print(f"取得資料時發生錯誤：{e}")
         return pd.DataFrame()  # 回傳空的 DataFrame
     
+# 取出建商
+def extract_company_name(row):
+    """
+    比對id與idlist中的ID，提取匹配的公司名稱
+    """
+    target_id = row['編號']
+    idlist = row['編號列表']
+    
+    # 如果idlist是字串格式的列表，需要先轉換
+    if isinstance(idlist, str):
+        try:
+            # 嘗試用ast.literal_eval轉換字串格式的列表
+            idlist = ast.literal_eval(idlist)
+        except:
+            # 如果轉換失敗，返回None
+            return None
+    
+    # 遍歷idlist中的每個項目
+    for item in idlist:
+        # 按逗號分割字串
+        parts = item.split(',')
+        if len(parts) >= 3:  # 確保有足夠的部分
+            item_id = parts[0].strip()  # ID部分
+            company_name = parts[2].strip()  # 公司名稱部分
+            
+            # 比對ID
+            if item_id == target_id:
+                return company_name
+    
+    # 如果沒有找到匹配的ID，返回None
+    return None
+
 
 # 合併dataframe
 def combined_df(url, input_time):
@@ -154,11 +187,42 @@ def parse_sale_period(s: str) -> Tuple[str, str]:
 
 # 定義函式：尋找自售期間及代銷期間的起始日，若沒有則回傳 None
 def find_first_sale_time(text):
+    """
+    尋找自售期間及代銷期間的起始日，支援多種日期格式
+    
+    支援格式：
+    - 1110701 (7位數字)
+    - 111年07月01日 / 111年7月1日 / 111年8月1號
+    - 111/07/01 / 111/7/1
+    
+    Returns:
+        str: 標準化的7位數字日期格式 (如: '1110701')，若沒有找到則回傳 None
+    """
     if not isinstance(text, str):
         return None
-    match = re.search(r"\d{7}", text)
-    if match:
-        return match.group(0)  # 取出第一個符合 7 位數字的字串
+    
+    # 1. 先檢查是否已經是7位數字格式
+    seven_digit_match = re.search(r"\d{7}", text)
+    if seven_digit_match:
+        return seven_digit_match.group(0)
+    
+    # 2. 檢查 "111年07月01日"、"111年7月1日" 或 "111年8月1號" 格式
+    year_month_day_match = re.search(r"(\d{3})年(\d{1,2})月(\d{1,2})[日號]", text)
+    if year_month_day_match:
+        year = year_month_day_match.group(1)
+        month = year_month_day_match.group(2).zfill(2)  # 補零到2位
+        day = year_month_day_match.group(3).zfill(2)    # 補零到2位
+        return f"{year}{month}{day}"
+    
+    # 3. 檢查 "111/07/01" 或 "111/7/1" 格式
+    slash_format_match = re.search(r"(\d{3})/(\d{1,2})/(\d{1,2})", text)
+    if slash_format_match:
+        year = slash_format_match.group(1)
+        month = slash_format_match.group(2).zfill(2)    # 補零到2位
+        day = slash_format_match.group(3).zfill(2)      # 補零到2位
+        return f"{year}{month}{day}"
+    
+    # 4. 如果都沒有匹配，回傳 None
     return None
 
 
@@ -225,3 +289,4 @@ def to_year_quarter(ts) -> str:
     if quarter < 1 or quarter > 4:
         return ""
     return f"{year}Y{quarter}S"
+

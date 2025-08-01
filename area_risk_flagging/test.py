@@ -34,7 +34,7 @@ class PresaleMarketAnalysis:
         if analysis_date:
             self.current_date = analysis_date
         else:
-            self.current_date = datetime(2024, 12, 31)
+            self.current_date = datetime(2025, 6, 30)
         print(f"分析基準日期設定為: {self.current_date.strftime('%Y-%m-%d')}")
         
     def load_data(self, transaction_file, community_file):
