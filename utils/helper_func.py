@@ -8,6 +8,9 @@ import ast
 from tqdm import tqdm 
 import pandas as pd
 import requests
+import numpy as np
+import os
+import math
 
 # 預售屋查詢 - 網址組合function
 def build_complete_urls(base_url, url_fragments):
@@ -289,4 +292,85 @@ def to_year_quarter(ts) -> str:
     if quarter < 1 or quarter > 4:
         return ""
     return f"{year}Y{quarter}S"
+
+# 將原始csv檔拆成小檔案
+
+def sample_csv_to_target_size(
+    input_path,
+    output_path="sample_10mb.csv",
+    target_mb=10,
+    encoding="utf-8-sig",
+    random_state=42
+):
+    """
+    從大型 CSV 中抽樣，產出接近指定 MB 大小的 CSV 檔案。
+    
+    Parameters:
+    - input_path: 原始 CSV 路徑
+    - output_path: 抽樣後儲存的 CSV 路徑
+    - target_mb: 目標大小（以 MB 為單位，預設 10MB）
+    - encoding: 輸出檔案的編碼（預設為 utf-8-sig）
+    - random_state: 抽樣亂數種子（確保可重現）
+    """
+    # 讀取原始 CSV
+    print(f" 讀取檔案中：{input_path}")
+    df = pd.read_csv(input_path)
+
+    # 計算平均每列大小
+    avg_row_size = df.memory_usage(deep=True).sum() / len(df)
+    target_bytes = target_mb * 1024 * 1024
+    target_rows = int(target_bytes / avg_row_size)
+
+    print(f" 平均每列大小：約 {avg_row_size:.2f} bytes")
+    print(f" 目標大小：{target_mb}MB ≈ {target_rows} 筆資料")
+
+    # 隨機抽樣
+    sampled_df = df.sample(n=target_rows, random_state=random_state)
+
+    # 儲存結果
+    sampled_df.to_csv(output_path, index=False, encoding=encoding)
+    actual_size = os.path.getsize(output_path) / (1024 * 1024)
+
+    print(f" 已儲存檔案：{output_path}，實際大小約 {actual_size:.2f} MB")
+    return sampled_df
+
+
+
+# 型態轉成datetime64
+
+def convert_mixed_date_columns(df, roc_cols=[], ad_cols=[], roc_slash_cols=[]):
+    def parse_roc_integer(val):
+        if pd.isna(val): return pd.NaT
+        try:
+            val = str(int(val)).zfill(7)
+            y, m, d = int(val[:3]) + 1911, int(val[3:5]), int(val[5:7])
+            return pd.Timestamp(f"{y}-{m:02d}-{d:02d}")
+        except: return pd.NaT
+
+    def parse_ad_integer(val):
+        if pd.isna(val): return pd.NaT
+        try:
+            val = str(int(val)).zfill(8)
+            return pd.to_datetime(val, format="%Y%m%d", errors='coerce')
+        except: return pd.NaT
+
+    def parse_roc_slash(val):
+        if pd.isna(val): return pd.NaT
+        try:
+            parts = str(val).split('/')
+            y, m, d = int(parts[0]) + 1911, int(parts[1]), int(parts[2])
+            return pd.Timestamp(f"{y}-{m:02d}-{d:02d}")
+        except: return pd.NaT
+
+    for col in roc_cols:
+        df[col] = df[col].apply(parse_roc_integer)
+
+    for col in ad_cols:
+        df[col] = df[col].apply(parse_ad_integer)
+
+    for col in roc_slash_cols:
+        df[col] = df[col].apply(parse_roc_slash)
+
+    return df
+
 
