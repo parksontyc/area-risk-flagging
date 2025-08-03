@@ -2,8 +2,9 @@ import os
 import re
 import time
 import datetime
-from typing import Tuple
+from typing import List, Set, Tuple
 import ast
+
 
 from tqdm import tqdm 
 import pandas as pd
@@ -138,8 +139,6 @@ def parse_admin_region(address):
     
 
 # 定義一個函式來解析銷售期間，回傳 (自售期間, 代銷期間)
-
-
 def parse_sale_period(s: str) -> Tuple[str, str]:
     """
     解析「銷售期間」字串，回傳 (自售時段, 代銷時段)。
@@ -293,8 +292,8 @@ def to_year_quarter(ts) -> str:
         return ""
     return f"{year}Y{quarter}S"
 
-# 將原始csv檔拆成小檔案
 
+# 將原始csv檔拆成小檔案
 def sample_csv_to_target_size(
     input_path,
     output_path="sample_10mb.csv",
@@ -335,9 +334,7 @@ def sample_csv_to_target_size(
     return sampled_df
 
 
-
 # 型態轉成datetime64
-
 def convert_mixed_date_columns(df, roc_cols=[], ad_cols=[], roc_slash_cols=[]):
     def parse_roc_integer(val):
         if pd.isna(val): return pd.NaT
@@ -372,5 +369,160 @@ def convert_mixed_date_columns(df, roc_cols=[], ad_cols=[], roc_slash_cols=[]):
         df[col] = df[col].apply(parse_roc_slash)
 
     return df
+
+
+# community_df取出編號列表中所有的備查編號
+def extract_mixed_alphanumeric_ids(text):
+    if pd.isna(text):
+        return ''
+    ids = re.findall(r'\b[A-Z0-9]{10,16}\b', text)
+    return ', '.join(ids)
+
+
+
+
+def parse_id_string(text: str) -> List[str]:
+    """
+    解析備查編號清單字串，返回清理後的編號列表
+    
+    Parameters:
+    -----------
+    text : str
+        包含多個備查編號的字串，以逗號分隔
+        
+    Returns:
+    --------
+    List[str]
+        清理後的備查編號列表
+    """
+    if pd.isna(text) or not isinstance(text, str) or text.strip() == '':
+        return []
+    
+    return [s.strip().strip("'\"") for s in text.split(',') if s.strip()]
+
+
+def create_transaction_lookup_structures(transaction_df: pd.DataFrame) -> Tuple[Set[str], pd.Series]:
+    """
+    建立交易資料的查詢結構以提升效能
+    
+    Parameters:
+    -----------
+    transaction_df : pd.DataFrame
+        交易資料，需包含備查編號、縣市、行政區、社區名稱欄位
+        
+    Returns:
+    --------
+    Tuple[Set[str], pd.Series]
+        (有效備查編號集合, composite_key對應的交易筆數)
+    """
+    # 建立有效備查編號集合
+    valid_ids = set(transaction_df['備查編號'].dropna().astype(str))
+    
+    # 建立 composite key 並統計交易筆數
+    composite_keys = (
+        transaction_df[['縣市', '行政區', '社區名稱']]
+        .fillna('')
+        .astype(str)
+        .agg('|'.join, axis=1)
+    )
+    
+    # 計算每個 composite key 的交易筆數
+    composite_key_counts = composite_keys.value_counts()
+    
+    return valid_ids, composite_key_counts
+
+
+def count_transactions_for_community(
+    row: pd.Series, 
+    valid_ids: Set[str], 
+    composite_key_counts: pd.Series,
+    transaction_df: pd.DataFrame
+) -> int:
+    """
+    計算單一社區的預售交易筆數
+    
+    Parameters:
+    -----------
+    row : pd.Series
+        社區資料的一列
+    valid_ids : Set[str]
+        有效的備查編號集合
+    composite_key_counts : pd.Series
+        composite key 對應的交易筆數
+    transaction_df : pd.DataFrame
+        交易資料（用於精確匹配）
+        
+    Returns:
+    --------
+    int
+        該社區的預售交易筆數
+    """
+    id_list = parse_id_string(row.get('備查編號清單', ''))
+    
+    # 方法1：優先使用備查編號匹配
+    if id_list:
+        matched_ids = [i for i in id_list if i in valid_ids]
+        if matched_ids:
+            return transaction_df['備查編號'].isin(matched_ids).sum()
+    
+    # 方法2：備查編號無法匹配時，使用 composite key
+    composite_key = f"{row.get('縣市', '')}|{row.get('行政區', '')}|{row.get('社區名稱', '')}"
+    return composite_key_counts.get(composite_key, 0)
+
+
+def calculate_presale_transaction_counts(community_df: pd.DataFrame, transaction_df: pd.DataFrame) -> pd.Series:
+    """
+    計算社區的預售交易筆數
+    
+    Parameters:
+    -----------
+    community_df : pd.DataFrame
+        包含備查編號清單的社區資料，需包含以下欄位：
+        - 備查編號清單: 逗號分隔的備查編號字串
+        - 縣市: 縣市名稱
+        - 行政區: 行政區名稱  
+        - 社區名稱: 社區名稱
+        
+    transaction_df : pd.DataFrame  
+        交易資料，需包含以下欄位：
+        - 備查編號: 備查編號
+        - 縣市: 縣市名稱
+        - 行政區: 行政區名稱
+        - 社區名稱: 社區名稱
+        
+    Returns:
+    --------
+    pd.Series
+        每個社區對應的預售交易筆數，索引與 community_df 相同
+        
+    Raises:
+    -------
+    ValueError
+        當必要欄位缺失時
+    """
+    # 檢查必要欄位
+    required_community_cols = ['備查編號清單', '縣市', '行政區', '社區名稱']
+    required_transaction_cols = ['備查編號', '縣市', '行政區', '社區名稱']
+    
+    missing_community_cols = [col for col in required_community_cols if col not in community_df.columns]
+    missing_transaction_cols = [col for col in required_transaction_cols if col not in transaction_df.columns]
+    
+    if missing_community_cols:
+        raise ValueError(f"community_df 缺少必要欄位: {missing_community_cols}")
+    if missing_transaction_cols:
+        raise ValueError(f"transaction_df 缺少必要欄位: {missing_transaction_cols}")
+    
+    # 建立查詢結構
+    valid_ids, composite_key_counts = create_transaction_lookup_structures(transaction_df)
+    
+    # 計算每個社區的交易筆數
+    transaction_counts = community_df.apply(
+        lambda row: count_transactions_for_community(
+            row, valid_ids, composite_key_counts, transaction_df
+        ),
+        axis=1
+    )
+    
+    return transaction_counts
 
 
