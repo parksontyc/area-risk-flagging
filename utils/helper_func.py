@@ -2,7 +2,7 @@ import os
 import re
 import time
 import datetime
-from typing import List, Set, Tuple
+from typing import  List, Set, Tuple, Dict
 import ast
 
 
@@ -334,6 +334,9 @@ def sample_csv_to_target_size(
     return sampled_df
 
 
+
+
+
 # 型態轉成datetime64
 def convert_mixed_date_columns(df, roc_cols=[], ad_cols=[], roc_slash_cols=[]):
     def parse_roc_integer(val):
@@ -379,8 +382,6 @@ def extract_mixed_alphanumeric_ids(text):
     return ', '.join(ids)
 
 
-
-
 def parse_id_string(text: str) -> List[str]:
     """
     解析備查編號清單字串，返回清理後的編號列表
@@ -401,9 +402,9 @@ def parse_id_string(text: str) -> List[str]:
     return [s.strip().strip("'\"") for s in text.split(',') if s.strip()]
 
 
-def create_transaction_lookup_structures(transaction_df: pd.DataFrame) -> Tuple[Set[str], pd.Series]:
+def create_transaction_lookup_structures(transaction_df: pd.DataFrame) -> Tuple[Dict[str, int], pd.Series]:
     """
-    建立交易資料的查詢結構以提升效能
+    建立交易資料的查詢結構，優先基於備查編號統計
     
     Parameters:
     -----------
@@ -412,13 +413,13 @@ def create_transaction_lookup_structures(transaction_df: pd.DataFrame) -> Tuple[
         
     Returns:
     --------
-    Tuple[Set[str], pd.Series]
-        (有效備查編號集合, composite_key對應的交易筆數)
+    Tuple[Dict[str, int], pd.Series]
+        (備查編號對應的交易筆數, composite_key對應的交易筆數)
     """
-    # 建立有效備查編號集合
-    valid_ids = set(transaction_df['備查編號'].dropna().astype(str))
+    # 第一優先：基於備查編號統計交易筆數
+    id_transaction_counts = transaction_df['備查編號'].value_counts().to_dict()
     
-    # 建立 composite key 並統計交易筆數
+    # 第二備援：基於複合鍵統計交易筆數（用於沒有備查編號匹配的情況）
     composite_keys = (
         transaction_df[['縣市', '行政區', '社區名稱']]
         .fillna('')
@@ -429,14 +430,13 @@ def create_transaction_lookup_structures(transaction_df: pd.DataFrame) -> Tuple[
     # 計算每個 composite key 的交易筆數
     composite_key_counts = composite_keys.value_counts()
     
-    return valid_ids, composite_key_counts
+    return id_transaction_counts, composite_key_counts
 
 
 def count_transactions_for_community(
     row: pd.Series, 
-    valid_ids: Set[str], 
-    composite_key_counts: pd.Series,
-    transaction_df: pd.DataFrame
+    id_transaction_counts: Dict[str, int],
+    composite_key_counts: pd.Series
 ) -> int:
     """
     計算單一社區的預售交易筆數
@@ -445,12 +445,10 @@ def count_transactions_for_community(
     -----------
     row : pd.Series
         社區資料的一列
-    valid_ids : Set[str]
-        有效的備查編號集合
+    id_transaction_counts : Dict[str, int]
+        備查編號對應的交易筆數
     composite_key_counts : pd.Series
         composite key 對應的交易筆數
-    transaction_df : pd.DataFrame
-        交易資料（用於精確匹配）
         
     Returns:
     --------
@@ -459,11 +457,14 @@ def count_transactions_for_community(
     """
     id_list = parse_id_string(row.get('備查編號清單', ''))
     
-    # 方法1：優先使用備查編號匹配
+    # 方法1：優先使用備查編號統計
     if id_list:
-        matched_ids = [i for i in id_list if i in valid_ids]
-        if matched_ids:
-            return transaction_df['備查編號'].isin(matched_ids).sum()
+        # 檢查是否有備查編號能在統計中找到
+        found_ids = [id for id in id_list if id in id_transaction_counts]
+        
+        if found_ids:
+            # 基於備查編號統計，累加所有匹配的備查編號交易筆數
+            return sum(id_transaction_counts[id] for id in found_ids)
     
     # 方法2：備查編號無法匹配時，使用 composite key
     composite_key = f"{row.get('縣市', '')}|{row.get('行政區', '')}|{row.get('社區名稱', '')}"
@@ -513,12 +514,12 @@ def calculate_presale_transaction_counts(community_df: pd.DataFrame, transaction
         raise ValueError(f"transaction_df 缺少必要欄位: {missing_transaction_cols}")
     
     # 建立查詢結構
-    valid_ids, composite_key_counts = create_transaction_lookup_structures(transaction_df)
+    id_transaction_counts, composite_key_counts = create_transaction_lookup_structures(transaction_df)
     
     # 計算每個社區的交易筆數
     transaction_counts = community_df.apply(
         lambda row: count_transactions_for_community(
-            row, valid_ids, composite_key_counts, transaction_df
+            row, id_transaction_counts, composite_key_counts
         ),
         axis=1
     )
@@ -526,3 +527,476 @@ def calculate_presale_transaction_counts(community_df: pd.DataFrame, transaction
     return transaction_counts
 
 
+def calculate_cancellation_counts(community_df: pd.DataFrame, transaction_df: pd.DataFrame) -> pd.Series:
+    """
+    計算社區的解約次數
+    
+    Parameters:
+    -----------
+    community_df : pd.DataFrame
+        包含備查編號清單的社區資料，需包含以下欄位：
+        - 備查編號清單: 逗號分隔的備查編號字串
+        - 縣市: 縣市名稱
+        - 行政區: 行政區名稱  
+        - 社區名稱: 社區名稱
+        
+    transaction_df : pd.DataFrame  
+        交易資料，需包含以下欄位：
+        - 備查編號: 備查編號
+        - 縣市: 縣市名稱
+        - 行政區: 行政區名稱
+        - 社區名稱: 社區名稱
+        - 解約情形: 解約狀態資訊
+        
+    Returns:
+    --------
+    pd.Series
+        每個社區對應的解約次數，索引與 community_df 相同
+        
+    Raises:
+    -------
+    ValueError
+        當必要欄位缺失時
+    """
+    # 檢查必要欄位
+    required_community_cols = ['備查編號清單', '縣市', '行政區', '社區名稱']
+    required_transaction_cols = ['備查編號', '縣市', '行政區', '社區名稱', '解約情形']
+    
+    missing_community_cols = [col for col in required_community_cols if col not in community_df.columns]
+    missing_transaction_cols = [col for col in required_transaction_cols if col not in transaction_df.columns]
+    
+    if missing_community_cols:
+        raise ValueError(f"community_df 缺少必要欄位: {missing_community_cols}")
+    if missing_transaction_cols:
+        raise ValueError(f"transaction_df 缺少必要欄位: {missing_transaction_cols}")
+    
+    # 建立解約查詢結構
+    def create_cancellation_lookup_structures(transaction_df):
+        # 第一優先：基於備查編號統計解約筆數
+        cancellation_df = transaction_df[transaction_df['解約情形'].notna()]
+        id_cancellation_counts = cancellation_df['備查編號'].value_counts().to_dict()
+        
+        # 第二備援：基於複合鍵統計解約筆數
+        composite_keys = (
+            cancellation_df[['縣市', '行政區', '社區名稱']]
+            .fillna('')
+            .astype(str)
+            .agg('|'.join, axis=1)
+        )
+        composite_cancellation_counts = composite_keys.value_counts()
+        
+        return id_cancellation_counts, composite_cancellation_counts
+    
+    def count_cancellations_for_community(row, id_cancellation_counts, composite_cancellation_counts):
+        id_list = parse_id_string(row.get('備查編號清單', ''))
+        
+        # 方法1：優先使用備查編號統計
+        if id_list:
+            found_ids = [id for id in id_list if id in id_cancellation_counts]
+            if found_ids:
+                return sum(id_cancellation_counts[id] for id in found_ids)
+        
+        # 方法2：備查編號無法匹配時，使用 composite key
+        composite_key = f"{row.get('縣市', '')}|{row.get('行政區', '')}|{row.get('社區名稱', '')}"
+        return composite_cancellation_counts.get(composite_key, 0)
+    
+    # 建立查詢結構
+    id_cancellation_counts, composite_cancellation_counts = create_cancellation_lookup_structures(transaction_df)
+    
+    # 計算每個社區的解約次數
+    cancellation_counts = community_df.apply(
+        lambda row: count_cancellations_for_community(
+            row, id_cancellation_counts, composite_cancellation_counts
+        ),
+        axis=1
+    )
+    
+    return cancellation_counts
+
+
+def create_fast_transaction_lookup(transaction_df: pd.DataFrame) -> tuple:
+    """
+    建立快速查詢結構，避免重複過濾和查詢
+    
+    Returns:
+    --------
+    tuple: (id_first_dates, composite_first_dates)
+        - id_first_dates: 備查編號對應的最初交易日期字典
+        - composite_first_dates: 複合鍵對應的最初交易日期字典
+    """
+    print("🔧 建立快速查詢結構...")
+    
+    # 一次性過濾正常交易（非解約）
+    normal_transactions = transaction_df[transaction_df['解約情形'].isna()].copy()
+    print(f"   正常交易筆數：{len(normal_transactions):,}")
+    
+    # 方法1：基於備查編號的最初交易日期查詢表
+    id_first_dates = {}
+    if '備查編號' in normal_transactions.columns:
+        # 移除空值的備查編號
+        valid_id_transactions = normal_transactions.dropna(subset=['備查編號'])
+        if not valid_id_transactions.empty:
+            # 使用 groupby 一次性計算所有備查編號的最初日期
+            id_groups = valid_id_transactions.groupby('備查編號')['交易日期'].min()
+            id_first_dates = id_groups.to_dict()
+    
+    print(f"   備查編號查詢表：{len(id_first_dates):,} 筆")
+    
+    # 方法2：基於複合鍵的最初交易日期查詢表
+    composite_first_dates = {}
+    if not normal_transactions.empty:
+        # 建立複合鍵
+        normal_transactions['composite_key'] = (
+            normal_transactions['縣市'].fillna('') + '|' +
+            normal_transactions['行政區'].fillna('') + '|' +
+            normal_transactions['社區名稱'].fillna('')
+        )
+        
+        # 使用 groupby 一次性計算所有複合鍵的最初日期
+        composite_groups = normal_transactions.groupby('composite_key')['交易日期'].min()
+        composite_first_dates = composite_groups.to_dict()
+    
+    print(f"   複合鍵查詢表：{len(composite_first_dates):,} 筆")
+    print("✅ 查詢結構建立完成")
+    
+    return id_first_dates, composite_first_dates
+
+
+def find_first_transaction_date_fast(
+    row: pd.Series, 
+    id_first_dates: dict,
+    composite_first_dates: dict
+) -> pd.Timestamp:
+    """
+    使用預建查詢表快速找出社區最初交易日期
+    
+    Parameters:
+    -----------
+    row : pd.Series
+        社區資料的一列
+    id_first_dates : dict
+        備查編號對應最初交易日期的字典
+    composite_first_dates : dict
+        複合鍵對應最初交易日期的字典
+        
+    Returns:
+    --------
+    pd.Timestamp or pd.NaT
+        該社區的最初交易日期
+    """
+    # 方法1：優先使用備查編號匹配
+    id_list = parse_id_string(row.get('備查編號清單', ''))
+    
+    if id_list:
+        # 找出所有匹配的備查編號對應的交易日期
+        matched_dates = []
+        for backup_id in id_list:
+            if backup_id in id_first_dates:
+                matched_dates.append(id_first_dates[backup_id])
+        
+        if matched_dates:
+            return min(matched_dates)  # 返回最早的日期
+    
+    # 方法2：使用複合鍵匹配
+    composite_key = f"{row.get('縣市', '')}|{row.get('行政區', '')}|{row.get('社區名稱', '')}"
+    
+    if composite_key in composite_first_dates:
+        return composite_first_dates[composite_key]
+    
+    # 如果都找不到，返回 NaT
+    return pd.NaT
+
+
+def calculate_first_transaction_dates_fast(
+    community_df: pd.DataFrame, 
+    transaction_df: pd.DataFrame
+) -> pd.Series:
+    """
+    高效能版本：計算所有社區的最初交易日期
+    
+    Parameters:
+    -----------
+    community_df : pd.DataFrame
+        社區資料
+    transaction_df : pd.DataFrame
+        交易資料
+        
+    Returns:
+    --------
+    pd.Series
+        每個社區對應的最初交易日期
+    """
+    start_time = time.time()
+    
+    # 檢查必要欄位
+    required_community_cols = ['備查編號清單', '縣市', '行政區', '社區名稱']
+    required_transaction_cols = ['備查編號', '交易日期', '解約情形']
+    
+    missing_community_cols = [col for col in required_community_cols if col not in community_df.columns]
+    missing_transaction_cols = [col for col in required_transaction_cols if col not in transaction_df.columns]
+    
+    if missing_community_cols:
+        raise ValueError(f"community_df 缺少必要欄位: {missing_community_cols}")
+    if missing_transaction_cols:
+        raise ValueError(f"transaction_df 缺少必要欄位: {missing_transaction_cols}")
+    
+    # 建立快速查詢結構
+    id_first_dates, composite_first_dates = create_fast_transaction_lookup(transaction_df)
+    
+    # 使用向量化操作計算最初交易日期
+    print("🚀 開始計算最初交易日期...")
+    
+    # 顯示進度條
+    tqdm.pandas(desc="計算進度")
+    
+    first_dates = community_df.progress_apply(
+        lambda row: find_first_transaction_date_fast(row, id_first_dates, composite_first_dates),
+        axis=1
+    )
+    
+    elapsed_time = time.time() - start_time
+    print(f"⚡ 計算完成！耗時：{elapsed_time:.2f} 秒")
+    
+    return first_dates
+
+
+def correct_sales_start_date(df, sales_col='銷售起始時間', first_tx_col='最初交易日期'):
+    """
+    修正銷售起始時間 > 最初交易日期的情況，僅當兩者皆非 NaT 時進行替換。
+
+    參數:
+        df (pd.DataFrame): 含有日期欄位的 DataFrame。
+        sales_col (str): 銷售起始時間欄位名稱，預設為 '銷售起始時間'。
+        first_tx_col (str): 最初交易日期欄位名稱，預設為 '最初交易日期'。
+
+    回傳:
+        修正後的 DataFrame。
+    """
+    # 建立條件
+    mask = (
+        df[sales_col].notna() &
+        df[first_tx_col].notna() &
+        (df[sales_col] > df[first_tx_col])
+    )
+
+    # 顯示修正筆數
+    print(f"🔁 共修正 {mask.sum()} 筆銷售起始時間")
+
+    # 執行替代
+    df.loc[mask, sales_col] = df.loc[mask, first_tx_col]
+    
+    return df
+
+
+# 處理重複社區
+def process_duplicate_communities(df):
+    """
+    處理重複社區的主函數 v2.1
+    
+    識別條件：行政區相同 + 建照執照相同 + 經度相同
+    處理規則：
+    1. 春豆子案例：戶數相加
+    2. 一般重複：取銷售起始時間較晚的記錄
+    
+    關連編號邏輯 (v2.1修正版)：
+    - 社區有效性欄位：1(有效)/0(無效)
+    - 關連編號欄位：有效社區=被合併的無效社區編號列表 / 無效社區=空值
+    
+    返回：
+    - processed_df: 處理後的DataFrame（包含新增欄位）
+    - report: 處理報告（包含關連編號完整性檢查）
+    """
+    
+    # 創建工作副本
+    df_processed = df.copy()
+    
+    # 新增社區有效性欄位和關連編號欄位（預設為有效）
+    df_processed['社區有效性'] = 1
+    df_processed['關連編號'] = None
+    
+    # 步驟1：識別重複社區群組
+    print("🔍 識別重複社區群組...")
+    duplicate_groups = identify_duplicate_groups(df_processed)
+    
+    # 步驟2：處理每個重複群組
+    print("⚙️ 處理重複社區...")
+    process_results = []
+    
+    for group_id, group_indices in duplicate_groups.items():
+        if len(group_indices) > 1:  # 只處理真正的重複群組
+            group_data = df_processed.loc[group_indices]
+            result = process_single_group(df_processed, group_indices, group_data)
+            process_results.append(result)
+    
+
+    
+    return df_processed
+
+def identify_duplicate_groups(df):
+    """
+    識別重複社區群組
+    條件：行政區 + 建照執照 + 經度相同
+    """
+    duplicate_groups = {}
+    group_id = 0
+    
+    # 建立分組條件
+    df['group_key'] = df['行政區'].astype(str) + '|' + \
+                     df['建照執照'].astype(str) + '|' + \
+                     df['經度'].astype(str)
+    
+    # 找出重複群組
+    group_counts = df['group_key'].value_counts()
+    duplicate_keys = group_counts[group_counts > 1].index
+    
+    for key in duplicate_keys:
+        indices = df[df['group_key'] == key].index.tolist()
+        if len(indices) > 1:
+            duplicate_groups[group_id] = indices
+            group_id += 1
+    
+    # 清理臨時欄位
+    df.drop('group_key', axis=1, inplace=True)
+    
+    print(f"發現 {len(duplicate_groups)} 個重複群組")
+    return duplicate_groups
+
+def process_single_group(df, group_indices, group_data):
+    """
+    處理單一重複群組
+    """
+    group_info = {
+        'group_indices': group_indices,
+        'communities': group_data[['編號', '社區名稱', '銷售起始時間', '戶數', '預售交易筆數', '解約筆數']].to_dict('records'),
+        'processing_type': '',
+        'valid_community': None,
+        'invalid_communities': [],
+        'merged_data': {}
+    }
+    
+    # 檢查是否為春豆子特殊案例
+    if is_spring_bean_case(group_data):
+        result = process_spring_bean_case(df, group_indices, group_data)
+        group_info.update(result)
+        group_info['processing_type'] = '春豆子特例（戶數相加）'
+    else:
+        result = process_general_case(df, group_indices, group_data)
+        group_info.update(result)
+        group_info['processing_type'] = '一般重複（取較晚銷售日期）'
+    
+    return group_info
+
+def is_spring_bean_case(group_data):
+    """
+    判斷是否為春豆子案例
+    """
+    community_names = group_data['社區名稱'].tolist()
+    return ('春豆子-公寓' in community_names and '春豆子-透天' in community_names)
+
+def process_spring_bean_case(df, group_indices, group_data):
+    """
+    處理春豆子特殊案例：戶數相加
+    """
+    # 選擇第一個記錄作為有效社區
+    valid_idx = group_indices[0]
+    invalid_indices = group_indices[1:]
+    valid_code = df.loc[valid_idx, '編號']
+    
+    # 計算合併後的數值
+    total_units = group_data['戶數'].sum()
+    total_transactions = group_data['預售交易筆數'].sum()
+    total_cancellations = group_data['解約筆數'].sum()
+    
+    # 合併備查編號
+    backup_numbers = group_data['備查編號清單'].dropna().tolist()
+    merged_backup_numbers = ', '.join(backup_numbers)
+    
+    # 收集無效社區編號
+    invalid_codes = [df.loc[idx, '編號'] for idx in invalid_indices]
+    merged_invalid_codes = ', '.join(invalid_codes)
+    
+    # 更新有效社區的數據
+    df.loc[valid_idx, '戶數'] = total_units
+    df.loc[valid_idx, '預售交易筆數'] = total_transactions
+    df.loc[valid_idx, '解約筆數'] = total_cancellations
+    df.loc[valid_idx, '備查編號清單'] = merged_backup_numbers
+    df.loc[valid_idx, '關連編號'] = merged_invalid_codes  # 有效社區記錄無效社區編號
+    
+    # 標記無效社區，關連編號保持為空
+    for idx in invalid_indices:
+        df.loc[idx, '社區有效性'] = 0
+        df.loc[idx, '關連編號'] = None  # 無效社區關連編號為空
+    
+    return {
+        'valid_community': valid_idx,
+        'valid_code': valid_code,
+        'invalid_communities': invalid_indices,
+        'invalid_codes': invalid_codes,
+        'merged_data': {
+            '戶數': total_units,
+            '預售交易筆數': total_transactions,
+            '解約筆數': total_cancellations,
+            '備查編號清單': merged_backup_numbers,
+            '關連編號': merged_invalid_codes
+        }
+    }
+
+def process_general_case(df, group_indices, group_data):
+    """
+    處理一般重複案例：取銷售起始時間較晚的記錄
+    """
+    # 轉換銷售起始時間為日期格式進行比較
+    group_data_copy = group_data.copy()
+    group_data_copy['銷售起始時間_date'] = pd.to_datetime(group_data_copy['銷售起始時間'], errors='coerce')
+    
+    # 找出銷售起始時間最晚的記錄，如果時間相同則選交易筆數較多的
+    valid_idx = None
+    latest_date = group_data_copy['銷售起始時間_date'].max()
+    latest_records = group_data_copy[group_data_copy['銷售起始時間_date'] == latest_date]
+    
+    if len(latest_records) == 1:
+        valid_idx = latest_records.index[0]
+    else:
+        # 時間相同時，選擇交易筆數較多的
+        valid_idx = latest_records['預售交易筆數'].idxmax()
+    
+    invalid_indices = [idx for idx in group_indices if idx != valid_idx]
+    valid_code = df.loc[valid_idx, '編號']
+    
+    # 計算合併後的數值
+    total_transactions = group_data['預售交易筆數'].sum()
+    total_cancellations = group_data['解約筆數'].sum()
+    
+    # 合併備查編號
+    backup_numbers = group_data['備查編號清單'].dropna().tolist()
+    merged_backup_numbers = ', '.join(backup_numbers)
+    
+    # 收集無效社區編號
+    invalid_codes = [df.loc[idx, '編號'] for idx in invalid_indices]
+    merged_invalid_codes = ', '.join(invalid_codes) if invalid_codes else None
+    
+    # 更新有效社區的數據
+    df.loc[valid_idx, '預售交易筆數'] = total_transactions
+    df.loc[valid_idx, '解約筆數'] = total_cancellations
+    df.loc[valid_idx, '備查編號清單'] = merged_backup_numbers
+    df.loc[valid_idx, '關連編號'] = merged_invalid_codes  # 有效社區記錄無效社區編號
+    # 戶數保持原值（較晚記錄的戶數）
+    
+    # 標記無效社區，關連編號保持為空
+    for idx in invalid_indices:
+        df.loc[idx, '社區有效性'] = 0
+        df.loc[idx, '關連編號'] = None  # 無效社區關連編號為空
+    
+    return {
+        'valid_community': valid_idx,
+        'valid_code': valid_code,
+        'invalid_communities': invalid_indices,
+        'invalid_codes': invalid_codes,
+        'merged_data': {
+            '戶數': df.loc[valid_idx, '戶數'],  # 保持原值
+            '預售交易筆數': total_transactions,
+            '解約筆數': total_cancellations,
+            '備查編號清單': merged_backup_numbers,
+            '關連編號': merged_invalid_codes
+        }
+    }
